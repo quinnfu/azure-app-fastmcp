@@ -21,6 +21,13 @@ import uvicorn
 
 load_dotenv() 
 
+# 调试信息
+import sys
+print(f"=== DEBUG INFO ===", file=sys.stderr)
+print(f"BASE_URL: {os.getenv('BASE_URL')}", file=sys.stderr)
+print(f"AZURE_CLIENT_ID: {os.getenv('AZURE_CLIENT_ID')}", file=sys.stderr)
+print(f"WEBSITE_HOSTNAME: {os.getenv('WEBSITE_HOSTNAME')}", file=sys.stderr)
+print(f"==================", file=sys.stderr)
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.azure import AzureProvider
 from fastmcp.server.dependencies import get_http_request
@@ -30,17 +37,38 @@ class PatchedAzureProvider(AzureProvider):
     def _get_resource_url(self, mcp_path):
         return None  # Force v2.0 behavior
 
+    def __init__(self, *args, **kwargs):
+        print(f"### PatchedAzureProvider.__init__ called with kwargs: {kwargs}", file=sys.stderr)
+        super().__init__(*args, **kwargs)
+        print(f"### PatchedAzureProvider initialized", file=sys.stderr)
+        # Check the CORRECT attribute name (with underscore)
+        print(f"### _allowed_client_redirect_uris: {getattr(self, '_allowed_client_redirect_uris', 'NOT_FOUND')}", file=sys.stderr)
+
     def authorize(self, *args, **kwargs):
+        print("=" * 80, file=sys.stderr)
+        print("### AUTHORIZE METHOD CALLED!", file=sys.stderr)
+        print(f"### args: {args}", file=sys.stderr)
+        print(f"### kwargs: {kwargs}", file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
+        
         # Remove resource from auth_params if present
         if len(args) >= 2 and hasattr(args[1], 'resource'):
-            # Create a copy of auth_params without the resource attribute
             auth_params = args[1]
             if hasattr(auth_params, '__dict__'):
-                # Create new auth_params without resource
                 new_auth_params = type(auth_params)(**{k: v for k, v in auth_params.__dict__.items() if k != 'resource'})
                 args = (args[0], new_auth_params) + args[2:]
 
         return super().authorize(*args, **kwargs)
+    
+    async def get_authorization_url(self, *args, **kwargs):
+        print("=" * 80, file=sys.stderr)
+        print("### get_authorization_url CALLED!", file=sys.stderr)
+        print(f"### args: {args}", file=sys.stderr)
+        print(f"### kwargs: {kwargs}", file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
+        result = await super().get_authorization_url(*args, **kwargs)
+        print(f"### get_authorization_url returning: {result}", file=sys.stderr)
+        return result
 
 
 auth = PatchedAzureProvider(
@@ -51,9 +79,10 @@ auth = PatchedAzureProvider(
     # Other available parameters:
     # redirect_path="/auth/callback",  # OAuth callback path
     required_scopes=["User.Read", "email", "openid", "profile"],  # Scopes required for API access
-    # allowed_client_redirect_uris=[...],  # Allowed client redirect URIs
+    # 使用通配符允许任意本地端口
+    allowed_client_redirect_uris=["http://127.0.0.1:*", "http://localhost:*"],
 )
-
+print(f"### DEBUG BASE_URL: {os.getenv('BASE_URL', 'http://localhost:8000')}")
 mcp = FastMCP("Azure OAuth Example Server", auth=auth)
 
 
@@ -135,9 +164,9 @@ async def get_user_profile() -> dict:
     except Exception as e:
         return {"error": f"Failed to get user profile: {str(e)}"}
 
-# fastmcp_asgi_app = mcp.asgi()
+# Expose ASGI app for Azure App Service
+fastmcp_asgi_app = mcp.http_app()
 
 if __name__ == "__main__":
-#     # Listen on 0.0.0.0 for all interfaces to avoid localhost/127.0.0.1 resolution issues
-    mcp.run(transport="http", port=8000, host="0.0.0.0")
-#     uvicorn.run('main:fastmcp_asgi_app', host='0.0.0.0', port=8000)
+    port = int(os.getenv("PORT", "8000"))
+    mcp.run(transport="http", port=port, host="0.0.0.0")
