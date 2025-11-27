@@ -1,143 +1,86 @@
-"""Azure (Microsoft Entra) OAuth server example for FastMCP.
-
-Using AzureProvider (recommended approach)
-
-Known issue: AzureProvider sends 'resource' parameter which is not supported by Azure AD v2.0 endpoint.
-Temporary solution: Manually remove the resource parameter from the OAuth authorization URL in the browser.
-
-Required environment variables:
-- AZURE_CLIENT_ID: Your Azure application (client) ID
-- AZURE_CLIENT_SECRET: Your Azure client secret  
-- AZURE_TENANT_ID: Tenant ID
-
-To run:
-    python application.py
-"""
-
-import os
-from dotenv import load_dotenv  
-import httpx
-import uvicorn
-
-load_dotenv() 
-
+# server.py
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.azure import AzureProvider
-from fastmcp.server.dependencies import get_http_request
+from fastmcp.server.dependencies import get_access_token
+import httpx
+import os
+from dotenv import load_dotenv
 
-# temporary solution to force v2.0 behavior of AzureProvider
-class PatchedAzureProvider(AzureProvider):
-    def _get_resource_url(self, mcp_path):
-        return None  # Force v2.0 behavior
+load_dotenv()
 
-    def authorize(self, *args, **kwargs):
-        # Remove resource from auth_params if present
-        if len(args) >= 2 and hasattr(args[1], 'resource'):
-            # Create a copy of auth_params without the resource attribute
-            auth_params = args[1]
-            if hasattr(auth_params, '__dict__'):
-                # Create new auth_params without resource
-                new_auth_params = type(auth_params)(**{k: v for k, v in auth_params.__dict__.items() if k != 'resource'})
-                args = (args[0], new_auth_params) + args[2:]
-
-        return super().authorize(*args, **kwargs)
-
-
-auth = PatchedAzureProvider(
-    client_id=os.getenv("AZURE_CLIENT_ID") or "",
-    client_secret=os.getenv("AZURE_CLIENT_SECRET") or "",
-    tenant_id=os.getenv("AZURE_TENANT_ID") or "",
-    base_url=os.getenv("BASE_URL", "http://localhost:8000"),  # 使用环境变量
-    # Other available parameters:
-    # redirect_path="/auth/callback",  # OAuth callback path
-    required_scopes=["User.Read", "email", "openid", "profile"],  # Scopes required for API access
-    # allowed_client_redirect_uris=[...],  # Allowed client redirect URIs
+# ============================================================================
+# Azure OAuth configuration
+# ============================================================================
+auth_provider = AzureProvider(
+    client_id=os.getenv("AZURE_CLIENT_ID"),
+    client_secret=os.getenv("AZURE_CLIENT_SECRET"),
+    tenant_id=os.getenv("AZURE_TENANT_ID"),
+    base_url="http://localhost:8000",
+    required_scopes=["mcp_access"],  # your custom API scope
+    additional_authorize_scopes=["User.Read", "Files.Read", "openid", "email", "profile"],
 )
 
-mcp = FastMCP("Azure OAuth Example Server", auth=auth)
+mcp = FastMCP(name="Azure Secured App", auth=auth_provider)
 
-
-@mcp.tool
-def echo(message: str) -> str:
-    """Echo the provided message back to the caller."""
-    return message
-
-
-@mcp.tool  
-def get_server_info() -> str:
-    """Get server information."""
-    return "FastMCP server with Azure OAuth authentication"
-
-
-@mcp.tool
-async def get_user_profile() -> dict:
-    """Get the current logged-in user's profile information.
-    
-    Returns a dictionary containing the following information:
-    - id: User ID
-    - displayName: Display name
-    - givenName: First name
-    - surname: Last name
-    - userPrincipalName: User principal name (usually email)
-    - mail: Email address
-    - jobTitle: Job title
-    - officeLocation: Office location
-    - mobilePhone: Mobile phone number
-    - businessPhones: Business phone numbers
-    - preferredLanguage: Preferred language
-    """
+# ============================================================================
+# Helper function: OBO flow to get Microsoft Graph API Token
+# ============================================================================
+async def get_graph_token() -> str | dict:
+    """get Graph API token using On-Behalf-Of (OBO) flow"""
     try:
-        # Get current HTTP request
-        request = get_http_request()
+        token = get_access_token()
+        token_url = f"https://login.microsoftonline.com/{os.getenv('AZURE_TENANT_ID')}/oauth2/v2.0/token"
         
-        # Get access token from request headers
-        auth_header = request.headers.get("authorization")
-        if not auth_header or not auth_header.startswith("Bearer "):
-            return {"error": "No valid access token provided"}
+        data = {
+            'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+            'client_id': os.getenv('AZURE_CLIENT_ID'),
+            'client_secret': os.getenv('AZURE_CLIENT_SECRET'),
+            'assertion': token.token,  # user's current token
+            'scope': 'https://graph.microsoft.com/.default',  # request all authorized Graph permissions
+            'requested_token_use': 'on_behalf_of'
+        }
         
-        access_token = auth_header.split("Bearer ")[1]
+        async with httpx.AsyncClient() as client:
+            response = await client.post(token_url, data=data)
+            if response.status_code != 200:
+                return {"error": f"Failed to get Graph token: {response.status_code}"}
+            return response.json()['access_token']
+    except Exception as e:
+        return {"error": str(e)}
+
+# ============================================================================
+# MCP tools
+# ============================================================================
+
+@mcp.tool
+async def get_user_info() -> dict:
+    """get basic user information"""
+    token = get_access_token()
+    return {
+        "name": token.claims.get("name"),
+        "email": token.claims.get("preferred_username"),
+        "azure_id": token.claims.get("sub"),
+    }
+
+@mcp.tool
+async def get_onedrive_info() -> dict:
+    """get user's OneDrive information"""
+    try:
+        # step 1: get Graph API token
+        graph_token = await get_graph_token()
+        if isinstance(graph_token, dict):  # error
+            return graph_token
         
-        # Call Microsoft Graph API to get user information
+        # step 2: call Microsoft Graph API
         async with httpx.AsyncClient() as client:
             response = await client.get(
-                "https://graph.microsoft.com/v1.0/me",
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json"
-                }
+                "https://graph.microsoft.com/v1.0/me/drive",
+                headers={"Authorization": f"Bearer {graph_token}"}
             )
             
             if response.status_code != 200:
-                return {
-                    "error": f"API call failed: {response.status_code}",
-                    "details": response.text
-                }
+                return {"error": f"Graph API error: {response.status_code}"}
             
-            data = response.json()
-            
-            # Extract main user information
-            profile = {
-                "id": data.get("id"),
-                "displayName": data.get("displayName"),
-                "givenName": data.get("givenName"),
-                "surname": data.get("surname"),
-                "userPrincipalName": data.get("userPrincipalName"),
-                "mail": data.get("mail"),
-                "jobTitle": data.get("jobTitle"),
-                "officeLocation": data.get("officeLocation"),
-                "mobilePhone": data.get("mobilePhone"),
-                "businessPhones": data.get("businessPhones", []),
-                "preferredLanguage": data.get("preferredLanguage"),
-            }
-            
-            return profile
-            
+            return response.json()
     except Exception as e:
-        return {"error": f"Failed to get user profile: {str(e)}"}
-
-# fastmcp_asgi_app = mcp.asgi()
-
-if __name__ == "__main__":
-#     # Listen on 0.0.0.0 for all interfaces to avoid localhost/127.0.0.1 resolution issues
-    mcp.run(transport="http", port=8000, host="0.0.0.0")
-#     uvicorn.run('main:fastmcp_asgi_app', host='0.0.0.0', port=8000)
+        return {"error": str(e)}
